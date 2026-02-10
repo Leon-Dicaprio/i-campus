@@ -1,0 +1,10 @@
+{
+  "123": {
+    "username": "123",
+    "password": "$2a$10$ppbPdI0YEbBVsJR3oRvKGOmjw/8DnC/EEGASaK/pdXDZlLViOQq3u"
+  },
+  "testuser": {
+    "username": "testuser",
+    "password": "$2a$10$EleEVRf6C1DeNQLSnONiz.VNgUGWSnDBm20.9rFTGzeCXTqUWxjxy"
+  }
+}
