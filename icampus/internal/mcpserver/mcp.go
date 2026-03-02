@@ -421,7 +421,9 @@ func (a *MCPAgent) Process(ctx context.Context, query string) (string, error) {
 【重要上下文】
 1. 默认位置：东莞理工学院松山湖校区（地址：广东省东莞市松山湖大学路1号）。
 2. 当用户问“附近”、“周边”或“去xxx怎么走”且未指定起点时，默认起点/中心点均为“东莞理工学院松山湖校区”。
-3. 遇到“好玩的”、“好吃的”等泛查询，请以校区为中心调用周边搜索工具。
+3. 搜索关键词策略：
+   - 必须保留用户提到的特定约束（如“西餐”、“粤菜”、“星巴克”等）。不要将其简化为泛分类（如“餐厅”）。
+   - 如果用户的问题包含具体品类，优先使用该品类作为 keywords 调用周边搜索工具。
 4. 必须积极使用工具获取信息，不要直接拒绝对话或要求用户提供已知的位置信息。`
 
 	msgs := []openai.ChatCompletionMessage{
@@ -473,6 +475,134 @@ func (a *MCPAgent) Process(ctx context.Context, query string) (string, error) {
 	}
 
 	return "", fmt.Errorf("exceeded max turns")
+}
+
+func (a *MCPAgent) ProcessStream(ctx context.Context, query string) (<-chan string, <-chan error) {
+	textChan := make(chan string)
+	errChan := make(chan error, 1)
+
+	go func() {
+		defer close(textChan)
+		defer close(errChan)
+
+		systemPrompt := `你是一个专注于“东莞理工学院（松山湖校区）”的智能校园出行助手。
+你的核心职责是利用地图工具回答用户关于校园及周边的位置、导航和生活服务问题。
+
+【重要上下文】
+1. 默认位置：东莞理工学院松山湖校区（地址：广东省东莞市松山湖大学路1号）。
+2. 当用户问“附近”、“周边”或“去xxx怎么走”且未指定起点时，默认起点/中心点均为“东莞理工学院松山湖校区”。
+3. 搜索关键词策略：
+   - 必须保留用户提到的特定约束（如“西餐”、“粤菜”、“星巴克”等）。不要将其简化为泛分类（如“餐厅”）。
+   - 如果用户的问题包含具体品类，优先使用该品类作为 keywords 调用周边搜索工具。
+4. 必须积极使用工具获取信息，不要直接拒绝对话或要求用户提供已知的位置信息。`
+
+		msgs := []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
+			{Role: openai.ChatMessageRoleUser, Content: query},
+		}
+
+		maxTurns := 20
+		for i := 0; i < maxTurns; i++ {
+			stream, err := a.LLM.CreateChatCompletionStream(ctx, openai.ChatCompletionRequest{
+				Model: "deepseek-chat", Messages: msgs, Tools: a.Tools, Stream: true,
+			})
+			if err != nil {
+				errChan <- fmt.Errorf("LLM 流请求错误: %v", err)
+				return
+			}
+
+			var fullContent strings.Builder
+			var toolCalls []openai.ToolCall
+
+			for {
+				resp, err := stream.Recv()
+				if err != nil {
+					if err.Error() == "EOF" {
+						break
+					}
+					errChan <- fmt.Errorf("流读取错误: %v", err)
+					stream.Close()
+					return
+				}
+
+				if len(resp.Choices) == 0 {
+					continue
+				}
+
+				delta := resp.Choices[0].Delta
+
+				// 处理内容
+				if delta.Content != "" {
+					fullContent.WriteString(delta.Content)
+					textChan <- delta.Content
+				}
+
+				// 处理工具调用 (分片累加)
+				if len(delta.ToolCalls) > 0 {
+					for _, tc := range delta.ToolCalls {
+						idx := 0
+						if tc.Index != nil {
+							idx = *tc.Index
+						}
+
+						// 扩容
+						for len(toolCalls) <= idx {
+							toolCalls = append(toolCalls, openai.ToolCall{})
+						}
+
+						if tc.ID != "" {
+							toolCalls[idx].ID = tc.ID
+						}
+						if tc.Type != "" {
+							toolCalls[idx].Type = tc.Type
+						}
+						if tc.Function.Name != "" {
+							toolCalls[idx].Function.Name += tc.Function.Name
+						}
+						if tc.Function.Arguments != "" {
+							toolCalls[idx].Function.Arguments += tc.Function.Arguments
+						}
+					}
+				}
+			}
+			stream.Close()
+
+			// 将 LLM 的回复加入历史
+			assistantMsg := openai.ChatCompletionMessage{
+				Role:    openai.ChatMessageRoleAssistant,
+				Content: fullContent.String(),
+			}
+			if len(toolCalls) > 0 {
+				assistantMsg.ToolCalls = toolCalls
+			}
+			msgs = append(msgs, assistantMsg)
+
+			// 如果没有工具调用，说明本次回复结束
+			if len(toolCalls) == 0 {
+				return
+			}
+
+			// 执行工具
+			for _, tc := range toolCalls {
+				fmt.Printf("  [MCP] 调用 %s 参数: %s\n", tc.Function.Name, tc.Function.Arguments)
+				resStr, err := a.Manager.Execute(tc.Function.Name, tc.Function.Arguments)
+				if err != nil {
+					resStr = fmt.Sprintf("Error: %v", err)
+				}
+				if len(resStr) > 2000 {
+					resStr = resStr[:2000] + "..."
+				}
+				fmt.Printf("  [MCP] <- 结果: %s...\n", limitString(resStr, 50))
+
+				msgs = append(msgs, openai.ChatCompletionMessage{
+					Role: openai.ChatMessageRoleTool, Content: resStr, ToolCallID: tc.ID,
+				})
+			}
+		}
+		errChan <- fmt.Errorf("exceeded max turns")
+	}()
+
+	return textChan, errChan
 }
 
 func limitString(s string, n int) string {

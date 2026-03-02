@@ -1,11 +1,14 @@
 package auth
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log"
 	"os"
-	"sync"
 
+	_ "github.com/go-sql-driver/mysql"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -15,102 +18,103 @@ type User struct {
 }
 
 type UserManager struct {
-	users    map[string]User
-	filePath string
-	mu       sync.RWMutex
+	db *sql.DB
 }
 
-func NewUserManager(filePath string) (*UserManager, error) {
+func NewUserManager(dsn string) (*UserManager, error) {
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %v", err)
+	}
+
+	// Ping to check connection
+	if err := db.Ping(); err != nil {
+		return nil, fmt.Errorf("failed to connect to database: %v", err)
+	}
+
 	um := &UserManager{
-		users:    make(map[string]User),
-		filePath: filePath,
+		db: db,
 	}
-	if err := um.load(); err != nil {
-		// If file doesn't exist, that's fine, we'll create it on save
-		if !os.IsNotExist(err) {
-			return nil, err
-		}
+
+	if err := um.initDB(); err != nil {
+		return nil, fmt.Errorf("failed to initialize database schema: %v", err)
 	}
+
 	return um, nil
 }
 
-func (um *UserManager) load() error {
-	um.mu.Lock()
-	defer um.mu.Unlock()
+func (um *UserManager) initDB() error {
+	query := `
+	CREATE TABLE IF NOT EXISTS users (
+		username VARCHAR(255) PRIMARY KEY,
+		password VARCHAR(255) NOT NULL
+	);`
+	_, err := um.db.Exec(query)
+	return err
+}
 
-	file, err := os.ReadFile(um.filePath)
+// MigrateFromJson loads users from a JSON file and inserts them into the database
+func (um *UserManager) MigrateFromJson(filePath string) error {
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		return nil // No file to migrate
+	}
+
+	file, err := os.ReadFile(filePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to read migration file: %v", err)
 	}
 
 	if len(file) == 0 {
 		return nil
 	}
 
-	return json.Unmarshal(file, &um.users)
-}
-
-func (um *UserManager) save() error {
-	um.mu.RLock()
-	defer um.mu.RUnlock()
-
-	data, err := json.MarshalIndent(um.users, "", "  ")
-	if err != nil {
-		return err
+	var users map[string]User
+	if err := json.Unmarshal(file, &users); err != nil {
+		return fmt.Errorf("failed to unmarshal migration data: %v", err)
 	}
 
-	return os.WriteFile(um.filePath, data, 0644)
+	for _, user := range users {
+		// Use INSERT IGNORE to skip existing users
+		_, err := um.db.Exec("INSERT IGNORE INTO users (username, password) VALUES (?, ?)", user.Username, user.Password)
+		if err != nil {
+			log.Printf("Failed to migrate user %s: %v", user.Username, err)
+		}
+	}
+
+	log.Printf("Migration completed from %s", filePath)
+	return nil
 }
 
 func (um *UserManager) Register(username, password string) error {
-	um.mu.Lock()
-	defer um.mu.Unlock()
-
-	if _, exists := um.users[username]; exists {
-		return errors.New("user already exists")
-	}
-
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		return err
 	}
 
-	um.users[username] = User{
-		Username: username,
-		Password: string(hashedPassword),
-	}
-
-	// Save immediately for persistence
-	// Note: We need to release the lock before calling save if save also locks.
-	// But here save() uses RLock, and we have Lock. RLock within Lock is fine? 
-	// Actually, RLock blocks if Lock is held by *another* goroutine. 
-	// But if the same goroutine holds Lock, RLock might deadlock or be allowed depending on implementation.
-	// Standard Go sync.RWMutex: "If a goroutine holds a RWMutex for reading and another goroutine might call Lock, no goroutine should expect to be able to acquire a read lock until the initial read lock is released. In particular, this prohibits recursive read locking."
-	// And "If a goroutine holds a RWMutex for writing, it is not allowed to acquire a read lock." -> deadlock!
-	
-	// So I should NOT call save() (which RLocks) inside Register() (which Locks).
-	// I should make an internal save function that doesn't lock, or just write the file here.
-	
-	// Refactoring to use an internal save helper without locking.
-	return um.saveWithoutLock()
-}
-
-func (um *UserManager) saveWithoutLock() error {
-	data, err := json.MarshalIndent(um.users, "", "  ")
+	_, err = um.db.Exec("INSERT INTO users (username, password) VALUES (?, ?)", username, string(hashedPassword))
 	if err != nil {
-		return err
+		return fmt.Errorf("user already exists or registration failed: %v", err)
 	}
-	return os.WriteFile(um.filePath, data, 0644)
+
+	return nil
 }
 
 func (um *UserManager) Login(username, password string) error {
-	um.mu.RLock()
-	user, exists := um.users[username]
-	um.mu.RUnlock()
-
-	if !exists {
-		return errors.New("invalid username or password")
+	var hashedPassword string
+	err := um.db.QueryRow("SELECT password FROM users WHERE username = ?", username).Scan(&hashedPassword)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return errors.New("invalid username or password")
+		}
+		return err
 	}
 
-	return bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(password))
+	return bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(password))
+}
+
+func (um *UserManager) Close() error {
+	if um.db != nil {
+		return um.db.Close()
+	}
+	return nil
 }

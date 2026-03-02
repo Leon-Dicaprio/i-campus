@@ -24,17 +24,23 @@ import (
 	"milvus-kb-demo/internal/search"
 	"milvus-kb-demo/internal/server"
 	"milvus-kb-demo/internal/service"
+	"milvus-kb-demo/internal/webretrieval"
+	"milvus-kb-demo/internal/webretrieval/pipeline"
 )
 
 // --- 全局配置 ---
 var (
-	ZillizEndpoint string
-	ZillizApiKey   string
-	ZhipuApiKey    string
-	DeepSeekApiKey string
-	CollectionName string
-	PdfPath        string
-	MCPConfigPath  string
+	ZillizEndpoint    string
+	ZillizApiKey      string
+	ZhipuApiKey       string
+	DeepSeekApiKey    string
+	SearchAPIEndpoint string
+	SearchAPIKey      string
+	SearchSiteDomain  string
+	CollectionName    string
+	PdfPath           string
+	MCPConfigPath     string
+	MySQLDSN          string
 )
 
 const (
@@ -50,12 +56,24 @@ func initConfig() {
 	ZillizApiKey = os.Getenv("ZILLIZ_API_KEY")
 	ZhipuApiKey = os.Getenv("ZHIPU_API_KEY")
 	DeepSeekApiKey = os.Getenv("DEEPSEEK_API_KEY")
+	SearchAPIEndpoint = os.Getenv("SEARCH_API_ENDPOINT")
+	SearchAPIKey = os.Getenv("SEARCH_API_KEY")
+	SearchSiteDomain = os.Getenv("SEARCH_SITE_DOMAIN")
 	CollectionName = os.Getenv("COLLECTION_NAME")
 	PdfPath = os.Getenv("PDF_PATH")
 	MCPConfigPath = "internal/mcpserver/mcp_config.json"
+	MySQLDSN = os.Getenv("MYSQL_DSN")
+
+	if MySQLDSN == "" {
+		// Default DSN matching docker-compose.yml
+		MySQLDSN = "icampus_user:icampus_password@tcp(127.0.0.1:3306)/icampus?charset=utf8mb4&parseTime=True&loc=Local"
+	}
 
 	if CollectionName == "" {
 		CollectionName = "student_handbook_kb"
+	}
+	if SearchSiteDomain == "" {
+		SearchSiteDomain = "dgut.edu.cn"
 	}
 	if PdfPath == "" {
 		PdfPath = "./handbook.pdf"
@@ -231,6 +249,7 @@ func runWeb(ctx context.Context, c client.Client, svc *service.Service, userMana
 }
 
 // --- Main 入口 ---
+// Application entry point
 func main() {
 	initConfig()
 
@@ -267,16 +286,41 @@ func main() {
 
 		decisionAgent := agent.NewDecisionAgent(llmClient)
 		retriever := rag.NewRetriever(c, CollectionName, llmClient)
-		searcher := search.NewBingSearcher()
 
-		svc := service.NewService(decisionAgent, retriever, searcher, llmClient, mcpAgent)
+		var webRetriever pipeline.WebRetriever
+		if SearchAPIEndpoint != "" {
+			var apiClient search.SearchAPIClient
+			if strings.Contains(strings.ToLower(SearchAPIEndpoint), "serpapi.com") {
+				apiClient = search.NewSerpAPISearchClient(SearchAPIKey)
+				fmt.Printf(">>> 🔍 使用 SerpAPI 进行联网搜索 (site:%s)\n", SearchSiteDomain)
+			} else {
+				apiClient = search.NewHTTPAPISearchClient(SearchAPIEndpoint, SearchAPIKey)
+				fmt.Printf(">>> 🔍 使用自定义 Search API 进行联网搜索: %s (site:%s)\n", SearchAPIEndpoint, SearchSiteDomain)
+			}
+			searcher := search.NewSiteLimitedSearcher(apiClient, SearchSiteDomain, 5)
+
+			// 初始化高级 Web Retrieval 流水线
+			webRetriever = webretrieval.NewDefaultWebRetriever(llmClient, searcher)
+			fmt.Println(">>> 🚀 已启用高级 Web Retrieval 流水线 (含内容提取、精炼与重排序)")
+		} else {
+			fmt.Println(">>> ℹ️ 未配置 SEARCH_API_ENDPOINT，联网搜索功能已禁用")
+		}
+
+		svc := service.NewService(decisionAgent, retriever, webRetriever, llmClient, mcpAgent)
 
 		if *mode == "web" {
-			// Initialize Auth
-			userManager, err := auth.NewUserManager("users.json")
+			// Initialize Auth with MySQL
+			userManager, err := auth.NewUserManager(MySQLDSN)
 			if err != nil {
 				log.Fatalf("Failed to initialize user manager: %v", err)
 			}
+			defer userManager.Close()
+
+			// Migrate existing users from JSON if present
+			if err := userManager.MigrateFromJson("users.json"); err != nil {
+				fmt.Printf("⚠️ 警告: 用户迁移失败: %v\n", err)
+			}
+
 			runWeb(ctx, c, svc, userManager)
 		} else {
 			runChat(ctx, c, svc)

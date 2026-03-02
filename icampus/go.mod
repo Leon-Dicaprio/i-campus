@@ -3,15 +3,20 @@ module milvus-kb-demo
 go 1.24.2
 
 require (
+	github.com/PuerkitoBio/goquery v1.9.2
+	github.com/go-sql-driver/mysql v1.9.3
 	github.com/joho/godotenv v1.5.1
 	github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728
 	github.com/milvus-io/milvus-sdk-go/v2 v2.4.2
 	github.com/sashabaranov/go-openai v1.41.2
 	golang.org/x/crypto v0.47.0
 	golang.org/x/net v0.48.0
+	golang.org/x/sync v0.19.0
 )
 
 require (
+	filippo.io/edwards25519 v1.1.0 // indirect
+	github.com/andybalholm/cascadia v1.3.2 // indirect
 	github.com/cockroachdb/errors v1.9.1 // indirect
 	github.com/cockroachdb/logtags v0.0.0-20211118104740-dabe8e521a4f // indirect
 	github.com/cockroachdb/redact v1.1.3 // indirect
@@ -27,7 +32,6 @@ require (
 	github.com/tidwall/gjson v1.14.4 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.0 // indirect
-	golang.org/x/sync v0.19.0 // indirect
 	golang.org/x/sys v0.40.0 // indirect
 	golang.org/x/text v0.33.0 // indirect
 	google.golang.org/genproto v0.0.0-20220503193339-ba3ae3f07e29 // indirect

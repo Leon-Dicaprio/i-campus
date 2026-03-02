@@ -10,13 +10,14 @@ import (
 	"milvus-kb-demo/internal/llm"
 	"milvus-kb-demo/internal/mcpserver"
 	"milvus-kb-demo/internal/rag"
-	"milvus-kb-demo/internal/search"
+	"milvus-kb-demo/internal/webretrieval/model"
+	"milvus-kb-demo/internal/webretrieval/pipeline"
 )
 
 type Service struct {
 	DecisionAgent *agent.DecisionAgent
 	Retriever     *rag.Retriever
-	Searcher      search.Searcher
+	WebRetriever  pipeline.WebRetriever
 	LLM           *llm.Client
 	MCPAgent      *mcpserver.MCPAgent
 }
@@ -26,11 +27,11 @@ type StreamEvent struct {
 	Content string `json:"content"`
 }
 
-func NewService(decisionAgent *agent.DecisionAgent, retriever *rag.Retriever, searcher search.Searcher, llmClient *llm.Client, mcpAgent *mcpserver.MCPAgent) *Service {
+func NewService(decisionAgent *agent.DecisionAgent, retriever *rag.Retriever, webRetriever pipeline.WebRetriever, llmClient *llm.Client, mcpAgent *mcpserver.MCPAgent) *Service {
 	return &Service{
 		DecisionAgent: decisionAgent,
 		Retriever:     retriever,
-		Searcher:      searcher,
+		WebRetriever:  webRetriever,
 		LLM:           llmClient,
 		MCPAgent:      mcpAgent,
 	}
@@ -39,9 +40,9 @@ func NewService(decisionAgent *agent.DecisionAgent, retriever *rag.Retriever, se
 func (s *Service) Answer(ctx context.Context, question string) (string, error) {
 	decision, err := s.DecisionAgent.Decide(ctx, question)
 	if err != nil {
-		decision = agent.SearchDecision{
-			NeedSearch:  true,
-			SearchQuery: question,
+		decision = agent.DecisionResult{
+			NeedSearch:    true,
+			SearchQueries: []string{question},
 		}
 	}
 
@@ -54,8 +55,8 @@ func (s *Service) Answer(ctx context.Context, question string) (string, error) {
 		} else {
 			fmt.Println("  [警告] MCP Agent 未启用，降级为普通搜索")
 			decision.NeedSearch = true
-			if decision.SearchQuery == "" {
-				decision.SearchQuery = question
+			if len(decision.SearchQueries) == 0 {
+				decision.SearchQueries = []string{question}
 			}
 		}
 	}
@@ -66,31 +67,56 @@ func (s *Service) Answer(ctx context.Context, question string) (string, error) {
 		fmt.Printf("  [决策] 不需要联网搜索 (原因: %s)\n", decision.Reason)
 	}
 
-	ragDocs, err := s.Retriever.Search(ctx, question, 5)
-	if err != nil {
-		ragDocs = nil
+	var ragDocs []string
+	// 如果明确不需要 Local RAG (例如天气/外网新闻)，则跳过
+	if decision.NeedLocalRAG {
+		ragDocs, err = s.Retriever.Search(ctx, question, 5)
+		if err != nil {
+			ragDocs = nil
+		}
+	} else {
+		fmt.Printf("  [决策] 不需要查询本地知识库 (NeedLocalRAG=false)\n")
 	}
 
-	var webResults []search.Result
+	var webResults []model.RankedDocument
 	if decision.NeedSearch {
-		query := strings.TrimSpace(decision.SearchQuery)
-		if query == "" {
-			query = question
-		}
-		fmt.Printf("  [搜索] 正在搜索: %s ...\n", query)
-		var err error
-		webResults, err = s.Searcher.Search(ctx, query)
-		if err != nil {
-			fmt.Printf("  [搜索] ❌ 搜索出错: %v\n", err)
+		if s.WebRetriever == nil {
+			fmt.Println("  [警告] 联网搜索已禁用，无法执行搜索")
 		} else {
-			fmt.Printf("  [搜索] 找到 %d 条相关网页\n", len(webResults))
-			for i, res := range webResults {
-				fmt.Printf("    %d. %s (%s...)\n", i+1, res.Title, limitStr(res.Snippet, 30))
+			queries := decision.SearchQueries
+			if len(queries) == 0 {
+				queries = []string{question}
+			}
+
+			var validQueries []string
+			for _, q := range queries {
+				if strings.TrimSpace(q) != "" {
+					validQueries = append(validQueries, strings.TrimSpace(q))
+				}
+			}
+
+			if len(validQueries) > 0 {
+				fmt.Printf("  [搜索] 正在通过高级流水线并行搜索: %v ...\n", validQueries)
+				opt := model.RetrievalOptions{
+					MaxSearchResults: 5,
+					MaxDocsToFetch:   3,
+					UseCache:         true,
+				}
+				res, err := s.WebRetriever.BatchRetrieve(ctx, validQueries, opt)
+				if err != nil {
+					fmt.Printf("  [搜索] ❌ 搜索出错: %v\n", err)
+				} else {
+					webResults = res.Documents
+					fmt.Printf("  [搜索] 找到 %d 条相关网页内容\n", len(webResults))
+					for i, doc := range webResults {
+						fmt.Printf("    %d. %s (%s...)\n", i+1, doc.Title, limitStr(doc.SummaryText, 30))
+					}
+				}
 			}
 		}
 	}
 
-	ctxText := fusion.BuildContext(ragDocs, webResults)
+	ctxText := fusion.BuildEnhancedContext(ragDocs, webResults)
 	prompt := buildFinalPrompt(ctxText, question)
 	return s.LLM.Call(ctx, prompt)
 }
@@ -104,52 +130,91 @@ func (s *Service) AnswerStream(ctx context.Context, question string) (<-chan Str
 		ch <- StreamEvent{Type: "status", Content: "Analyzing question..."}
 		decision, err := s.DecisionAgent.Decide(ctx, question)
 		if err != nil {
-			decision = agent.SearchDecision{
-				NeedSearch:  true,
-				SearchQuery: question,
+			decision = agent.DecisionResult{
+				NeedSearch:    true,
+				SearchQueries: []string{question},
 			}
 		}
 
 		if decision.NeedMCP {
 			ch <- StreamEvent{Type: "status", Content: "Calling Map Service..."}
 			if s.MCPAgent != nil {
-				res, err := s.MCPAgent.Process(ctx, question)
-				if err != nil {
-					ch <- StreamEvent{Type: "error", Content: err.Error()}
-				} else {
-					ch <- StreamEvent{Type: "token", Content: res}
+				textChan, errChan := s.MCPAgent.ProcessStream(ctx, question)
+				for {
+					select {
+					case text, ok := <-textChan:
+						if !ok {
+							textChan = nil
+						} else {
+							ch <- StreamEvent{Type: "token", Content: text}
+						}
+					case e, ok := <-errChan:
+						if ok && e != nil {
+							ch <- StreamEvent{Type: "error", Content: e.Error()}
+						}
+						errChan = nil
+					}
+					if textChan == nil && errChan == nil {
+						break
+					}
 				}
 				return
 			}
 			decision.NeedSearch = true
-			if decision.SearchQuery == "" {
-				decision.SearchQuery = question
+			if len(decision.SearchQueries) == 0 {
+				decision.SearchQueries = []string{question}
 			}
 		}
 
-		ch <- StreamEvent{Type: "status", Content: "Retrieving knowledge..."}
-		ragDocs, err := s.Retriever.Search(ctx, question, 5)
-		if err != nil {
-			ragDocs = nil
+		var ragDocs []string
+		if decision.NeedLocalRAG {
+			ch <- StreamEvent{Type: "status", Content: "Retrieving knowledge..."}
+			var errSearch error
+			ragDocs, errSearch = s.Retriever.Search(ctx, question, 5)
+			if errSearch != nil {
+				ragDocs = nil
+			}
+		} else {
+			ch <- StreamEvent{Type: "status", Content: "Skipping knowledge retrieval..."}
 		}
 
-		var webResults []search.Result
+		var webResults []model.RankedDocument
 		if decision.NeedSearch {
-			ch <- StreamEvent{Type: "status", Content: "Searching web..."}
-			query := strings.TrimSpace(decision.SearchQuery)
-			if query == "" {
-				query = question
-			}
+			if s.WebRetriever != nil {
+				ch <- StreamEvent{Type: "status", Content: "Searching web..."}
+				queries := decision.SearchQueries
+				if len(queries) == 0 {
+					queries = []string{question}
+				}
 
-			var err error
-			webResults, err = s.Searcher.Search(ctx, query)
-			if err != nil {
-				// ignore error
+				var validQueries []string
+				for _, q := range queries {
+					if strings.TrimSpace(q) != "" {
+						validQueries = append(validQueries, strings.TrimSpace(q))
+					}
+				}
+
+				if len(validQueries) > 0 {
+					opt := model.RetrievalOptions{
+						MaxSearchResults: 5,
+						MaxDocsToFetch:   3,
+						UseCache:         true,
+						OnProgress: func(msg string) {
+							ch <- StreamEvent{Type: "status", Content: msg}
+						},
+					}
+					res, err := s.WebRetriever.BatchRetrieve(ctx, validQueries, opt)
+					if err == nil {
+						webResults = res.Documents
+					}
+				}
+			} else {
+				ch <- StreamEvent{Type: "status", Content: "Web search disabled, skipping..."}
 			}
 		}
 
 		ch <- StreamEvent{Type: "status", Content: "Generating answer..."}
-		ctxText := fusion.BuildContext(ragDocs, webResults)
+		ctxText := fusion.BuildEnhancedContext(ragDocs, webResults)
 		prompt := buildFinalPrompt(ctxText, question)
 
 		textChan, errChan := s.LLM.CallStream(ctx, prompt)
@@ -162,9 +227,9 @@ func (s *Service) AnswerStream(ctx context.Context, question string) (<-chan Str
 				} else {
 					ch <- StreamEvent{Type: "token", Content: text}
 				}
-			case err, ok := <-errChan:
-				if ok && err != nil {
-					ch <- StreamEvent{Type: "error", Content: err.Error()}
+			case e, ok := <-errChan:
+				if ok && e != nil {
+					ch <- StreamEvent{Type: "error", Content: e.Error()}
 				}
 				errChan = nil
 			}
@@ -178,14 +243,18 @@ func (s *Service) AnswerStream(ctx context.Context, question string) (<-chan Str
 }
 
 func buildFinalPrompt(contextText, question string) string {
-	return fmt.Sprintf(`你是东莞理工学院官方智能客服。
+	return fmt.Sprintf(`你是一个严谨的研究助手。请严格且仅根据我提供的参考资料回答问题。
 
-请【基于已知信息】回答学生问题。
-如果已知信息中包含相关通知或时间，请直接总结并列出。
-如果已知信息不足或没有具体细节，再说明“建议查看官网”。
-
-已知信息：
+参考资料：
 %s
+
+回答要求：
+
+如果参考资料中没有相关信息，请直接回答“根据搜索结果未找到相关信息”，绝不允许使用你的内部知识编造。
+
+你的每一句陈述，必须在句末使用角标标明信息来源，格式为 [1] 或 [1][2]。
+
+保持客观中立的语气。
 
 学生问题：%s`, contextText, question)
 }

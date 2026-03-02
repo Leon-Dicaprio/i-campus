@@ -6,15 +6,18 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"milvus-kb-demo/internal/llm"
 )
 
-type SearchDecision struct {
-	NeedSearch  bool   `json:"need_search"`
-	SearchQuery string `json:"search_query"`
-	NeedMCP     bool   `json:"need_mcp"`
-	Reason      string `json:"reason"`
+type DecisionResult struct {
+	NeedLocalRAG  bool     `json:"need_local_rag"`
+	NeedSearch    bool     `json:"need_search"`
+	SearchQueries []string `json:"search_queries"`
+	NeedMCP       bool     `json:"need_mcp"`
+	MCPToolName   string   `json:"mcp_tool_name"`
+	Reason        string   `json:"reason"`
 }
 
 type DecisionAgent struct {
@@ -25,10 +28,12 @@ func NewDecisionAgent(llmClient *llm.Client) *DecisionAgent {
 	return &DecisionAgent{llm: llmClient}
 }
 
-func (a *DecisionAgent) Decide(ctx context.Context, question string) (SearchDecision, error) {
+func (a *DecisionAgent) Decide(ctx context.Context, question string) (DecisionResult, error) {
+	currentTime := time.Now().Format("2006年1月2日 星期一")
 	prompt := fmt.Sprintf(`你是高校智能客服系统的“搜索决策模块”。
 
 判断用户问题是否需要【联网搜索】或【地图服务】。
+当前系统时间是：%s
 
 规则：
 - 学生手册、规章制度、固定流程 → 不需要搜索 (need_search=false, need_mcp=false)
@@ -36,37 +41,46 @@ func (a *DecisionAgent) Decide(ctx context.Context, question string) (SearchDeci
 - 不确定或可能变化 → 需要搜索 (need_search=true)
 - 地点查询、路线规划、导航、周边查询、距离计算 → 需要地图服务 (need_mcp=true, need_search=false)
 
+关键词改写要求：
+1. 将年份缩写补全，如“25年”改为“2025年”。
+2. 将口语化词汇改为正式书面语。
+3. 如果问题隐含特定学校，必须加上“东莞理工学院”。
+
 仅返回 JSON，不要解释。
 
 {
+  "need_local_rag": true/false, // 建议加这个：如果明确是问天气/外网新闻，没必要查 Milvus，节省时间
   "need_search": true/false,
-  "search_query": "用于搜索的关键词",
+  "search_queries": ["用于搜索的关键词1", "关键词2"], // 重点！让大模型拆分并改写搜索词
   "need_mcp": true/false,
+  "mcp_tool_name": "工具名称", // 如果需要地图服务，填写 amap_search
   "reason": "简短原因"
 }
 
 用户问题：
-%s`, question)
+%s`, currentTime, question)
 
 	raw, err := a.llm.Call(ctx, prompt)
 	if err != nil {
-		return SearchDecision{}, err
+		return DecisionResult{}, err
 	}
 
 	decision, err := parseDecision(raw)
 	if err != nil {
-		return SearchDecision{}, err
+		return DecisionResult{}, err
 	}
 
 	decision = applyOverrides(question, decision)
-	if decision.NeedSearch && strings.TrimSpace(decision.SearchQuery) == "" {
-		decision.SearchQuery = strings.TrimSpace(question)
+	if decision.NeedSearch && len(decision.SearchQueries) == 0 {
+		decision.SearchQueries = []string{strings.TrimSpace(question)}
 	}
 	return decision, nil
 }
 
-func parseDecision(raw string) (SearchDecision, error) {
-	var decision SearchDecision
+func parseDecision(raw string) (DecisionResult, error) {
+	decision := DecisionResult{
+		NeedLocalRAG: true, // Default to true
+	}
 	if err := json.Unmarshal([]byte(raw), &decision); err == nil {
 		return decision, nil
 	}
@@ -77,33 +91,54 @@ func parseDecision(raw string) (SearchDecision, error) {
 			return decision, nil
 		}
 	}
-	return SearchDecision{}, fmt.Errorf("invalid decision json")
+	return DecisionResult{}, fmt.Errorf("invalid decision json")
 }
 
-func applyOverrides(question string, decision SearchDecision) SearchDecision {
+func applyOverrides(question string, decision DecisionResult) DecisionResult {
 	q := strings.ToLower(question)
+
+	// 如果包含年份，通常需要联网搜索最新通知
+	yearRegex := regexp.MustCompile(`(20)?2[4-6]年?`)
+	if yearRegex.MatchString(q) {
+		decision.NeedSearch = true
+		if len(decision.SearchQueries) == 0 {
+			decision.SearchQueries = []string{question}
+		}
+		if decision.Reason == "" {
+			decision.Reason = "需要查询特定年份的最新通知"
+		}
+		return decision
+	}
+
+	// 体测安排通常需要联网搜索
+	if strings.Contains(q, "体测安排") {
+		decision.NeedSearch = true
+		if len(decision.SearchQueries) == 0 {
+			decision.SearchQueries = []string{question}
+		}
+		if decision.Reason == "" {
+			decision.Reason = "体测安排具有时效性"
+		}
+		return decision
+	}
+
+	// 基础免测流程通常是固定的
 	if strings.Contains(q, "体测") && strings.Contains(q, "免测") {
 		decision.NeedSearch = false
 		decision.NeedMCP = false
 		if decision.Reason == "" {
-			decision.Reason = "固定流程"
+			decision.Reason = "体测免测固定流程 (若需最新年份通知请说明年份)"
 		}
 		return decision
 	}
-	if strings.Contains(q, "体测安排") && regexp.MustCompile(`20\d{2}`).MatchString(q) {
-		decision.NeedSearch = true
-		decision.NeedMCP = false
-		if decision.SearchQuery == "" {
-			decision.SearchQuery = question
-		}
-		if decision.Reason == "" {
-			decision.Reason = "时间可能变化"
-		}
-	}
-	// 简单的关键词覆盖，确保地图相关问题能命中 MCP
+
+	// 地图保底逻辑
 	if strings.Contains(q, "哪里") || strings.Contains(q, "路线") || strings.Contains(q, "导航") || strings.Contains(q, "位置") || strings.Contains(q, "怎么走") {
-		// 如果 LLM 没判出来，这里强制修正一下，但通常 LLM 更准
-		// 这里只作为保底，或者可以不加，相信 LLM
+		decision.NeedMCP = true
+		if decision.MCPToolName == "" {
+			decision.MCPToolName = "amap_search"
+		}
 	}
+
 	return decision
 }
